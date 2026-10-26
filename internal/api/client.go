@@ -4,60 +4,104 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/makeluaurights/kovchegchain/internal/core"
 )
 
-// Client — HTTP-клиент к узлу.
+// Client — HTTP-клиент к API v1 узла.
 type Client struct {
 	Base string // например "http://127.0.0.1:7070"
 	HTTP *http.Client
 }
 
-// NewClient создаёт клиента с таймаутом.
+// Error — ошибка, которую вернул узел.
+type Error struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (e *Error) Error() string { return "узел: " + e.Message }
+
+// NewClient создаёт клиента.
 func NewClient(base string) *Client {
-	return &Client{Base: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: 10 * time.Second}}
+	return &Client{Base: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: 90 * time.Second}}
 }
 
-// Info — GET /info.
-func (c *Client) Info() (*InfoResponse, error) {
-	var r InfoResponse
-	return &r, c.do(http.MethodGet, "/info", nil, &r)
+// Status — GET /v1/status.
+func (c *Client) Status() (*StatusView, error) {
+	var r StatusView
+	return &r, c.do(http.MethodGet, "/v1/status", nil, &r)
 }
 
-// Balance — GET /balance.
-func (c *Client) Balance(addr core.Address) (*BalanceResponse, error) {
-	var r BalanceResponse
-	return &r, c.do(http.MethodGet, "/balance?address="+url.QueryEscape(string(addr)), nil, &r)
+// Account — GET /v1/accounts/{address}.
+func (c *Client) Account(addr core.Address) (*AccountView, error) {
+	var r AccountView
+	return &r, c.do(http.MethodGet, "/v1/accounts/"+url.PathEscape(string(addr)), nil, &r)
 }
 
-// SubmitTx — POST /tx.
-func (c *Client) SubmitTx(tx *core.Tx) (core.Hash, error) {
-	var r SubmitResponse
-	err := c.do(http.MethodPost, "/tx", tx, &r)
-	return r.Hash, err
+// AccountTxs — GET /v1/accounts/{address}/txs.
+func (c *Client) AccountTxs(addr core.Address, before string, limit int) (*TxList, error) {
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var r TxList
+	return &r, c.do(http.MethodGet, "/v1/accounts/"+url.PathEscape(string(addr))+"/txs?"+q.Encode(), nil, &r)
 }
 
-// Tx — GET /tx.
-func (c *Client) Tx(h core.Hash) (*TxResponse, error) {
-	var r TxResponse
-	return &r, c.do(http.MethodGet, "/tx?hash="+h.String(), nil, &r)
+// SubmitTx — POST /v1/txs. С wait=true ждёт подтверждения не дольше timeout.
+func (c *Client) SubmitTx(tx *core.Tx, wait bool, timeout time.Duration) (*SubmitView, error) {
+	path := "/v1/txs"
+	if wait {
+		path += "?wait=true&timeout=" + strconv.Itoa(max(1, int(timeout/time.Second)))
+	}
+	var r SubmitView
+	return &r, c.do(http.MethodPost, path, tx, &r)
+}
+
+// Tx — GET /v1/txs/{hash}.
+func (c *Client) Tx(h core.Hash) (*TxView, error) {
+	var r TxView
+	return &r, c.do(http.MethodGet, "/v1/txs/"+h.String(), nil, &r)
+}
+
+// Block — GET /v1/blocks/{id}: номер, хэш или "latest".
+func (c *Client) Block(id string) (*BlockView, error) {
+	var r BlockView
+	return &r, c.do(http.MethodGet, "/v1/blocks/"+url.PathEscape(id), nil, &r)
+}
+
+// Blocks — GET /v1/blocks.
+func (c *Client) Blocks(before string, limit int) (*BlockList, error) {
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var r BlockList
+	return &r, c.do(http.MethodGet, "/v1/blocks?"+q.Encode(), nil, &r)
 }
 
 func (c *Client) do(method, path string, body, out any) error {
-	var rd *bytes.Reader
+	var rd io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
 		rd = bytes.NewReader(data)
-	} else {
-		rd = bytes.NewReader(nil)
 	}
 	req, err := http.NewRequest(method, c.Base+path, rd)
 	if err != nil {
@@ -72,11 +116,11 @@ func (c *Client) do(method, path string, body, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		var e errorResponse
+		var e ErrorView
 		if json.NewDecoder(resp.Body).Decode(&e) == nil && e.Error != "" {
-			return fmt.Errorf("узел: %s", e.Error)
+			return &Error{Status: resp.StatusCode, Code: e.Code, Message: e.Error}
 		}
-		return fmt.Errorf("узел: HTTP %d", resp.StatusCode)
+		return &Error{Status: resp.StatusCode, Code: "http", Message: fmt.Sprintf("HTTP %d", resp.StatusCode)}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }

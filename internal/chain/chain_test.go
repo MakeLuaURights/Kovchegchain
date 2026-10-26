@@ -312,8 +312,8 @@ func TestPersistence(t *testing.T) {
 	if e.balance(to) != 7*core.NanoPerKVG {
 		t.Fatal("баланс потерян после перезапуска")
 	}
-	if _, status, height, err := e.chain.Tx(h); err != nil || status != TxConfirmed || height != 1 {
-		t.Fatalf("транзакция после перезапуска: %v %v %d", err, status, height)
+	if info, err := e.chain.Tx(h); err != nil || info.Status != TxConfirmed || info.Height != 1 {
+		t.Fatalf("транзакция после перезапуска: %v %+v", err, info)
 	}
 	if _, err := e.chain.SubmitTx(e.tx(e.creator, to, 1, 0)); !errors.Is(err, core.ErrBadNonce) {
 		t.Fatalf("nonce не сохранился: %v", err)
@@ -331,5 +331,81 @@ func TestGenesisMismatch(t *testing.T) {
 	e.store = s
 	if _, err := New(s, e.genesis, DefaultConfig(e.producer)); !errors.Is(err, ErrGenesisChanged) {
 		t.Fatalf("ожидалась ErrGenesisChanged, получено %v", err)
+	}
+}
+
+func TestSubscribe(t *testing.T) {
+	e := newEnv(t)
+	ch, cancel := e.chain.Subscribe()
+	defer cancel()
+
+	e.chain.SubmitTx(e.tx(e.creator, e.producer, 1, 0))
+	b := e.produce()
+	select {
+	case got := <-ch:
+		if got.Hash != b.Hash {
+			t.Fatal("пришёл не тот блок")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("блок не пришёл подписчику")
+	}
+	cancel()
+	cancel() // повторный вызов безопасен
+	if _, ok := <-ch; ok {
+		t.Fatal("канал не закрыт после cancel")
+	}
+}
+
+func TestSlowSubscriberDropped(t *testing.T) {
+	e := newEnv(t)
+	cfg := DefaultConfig(e.producer)
+	cfg.EmptyBlocks = true
+	c, err := New(e.store, e.genesis, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := c.Subscribe()
+	defer cancel()
+	now := e.now
+	for i := 0; i < subscriberBuffer+1; i++ {
+		now = now.Add(time.Second)
+		if _, err := c.ProduceBlock(now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := 0
+	for range ch {
+		n++
+	}
+	if n != subscriberBuffer {
+		t.Fatalf("получено %d блоков, затем канал должен закрыться", n)
+	}
+}
+
+func TestStats(t *testing.T) {
+	e := newEnv(t)
+	alice := newKey(t)
+	e.chain.SubmitTx(e.tx(e.creator, addrOf(alice), 5, 0))
+	e.chain.SubmitTx(e.tx(e.creator, addrOf(alice), 5, 1))
+	e.produce()
+	e.chain.SubmitTx(e.tx(alice, addrOf(e.creator), 1, 0))
+
+	st, err := e.chain.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Аккаунты: создатель, alice, производитель (получил комиссии).
+	if st.Height != 1 || st.TxCount != 2 || st.AccountCount != 3 || st.Supply != supply || st.MempoolSize != 1 {
+		t.Fatalf("%+v", st)
+	}
+	if p := e.chain.PendingFor(addrOf(alice)); len(p) != 1 || p[0].Status != TxPending {
+		t.Fatalf("PendingFor: %+v", p)
+	}
+	if m := e.chain.Mempool(10); len(m) != 1 {
+		t.Fatalf("Mempool: %+v", m)
+	}
+	h, more, err := e.chain.AddressTxs(addrOf(alice), nil, 10)
+	if err != nil || len(h) != 2 || more || h[0].Index != 1 || h[0].BlockHash != e.chain.Head().Hash {
+		t.Fatalf("AddressTxs: %+v %v %v", h, more, err)
 	}
 }

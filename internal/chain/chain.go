@@ -43,6 +43,30 @@ const (
 	TxConfirmed TxStatus = "confirmed" // в блоке
 )
 
+// TxInfo — транзакция и где она находится.
+type TxInfo struct {
+	Tx     core.Tx
+	Hash   core.Hash
+	Status TxStatus
+	// Для confirmed:
+	Height    uint64
+	Index     uint32
+	BlockHash core.Hash
+	BlockTime int64
+}
+
+// Stats — сводка по сети.
+type Stats struct {
+	Height       uint64
+	TxCount      uint64 // транзакций в блоках
+	AccountCount uint64
+	Supply       uint64 // монет всего, нано-KVG; комиссии не сжигаются, поэтому постоянно
+	MempoolSize  int
+}
+
+// subscriberBuffer — сколько блоков может ждать медленный подписчик, прежде чем его отключат.
+const subscriberBuffer = 64
+
 // Chain — цепочка узла. Все методы безопасны для вызова из разных горутин.
 type Chain struct {
 	mu      sync.Mutex
@@ -53,6 +77,11 @@ type Chain struct {
 	pool    []*core.Tx // в порядке приёма; у каждого отправителя nonce идут подряд
 	poolIdx map[core.Hash]*core.Tx
 	pending *core.Overlay // подтверждённое состояние + все транзакции мемпула
+	genesis core.Hash
+	supply  uint64
+
+	subs   map[int]chan *core.Block
+	nextID int
 }
 
 // New открывает цепочку. Если база пуста — записывает генезис-блок и начальные балансы,
@@ -97,6 +126,12 @@ func New(store *storage.Store, g *core.Genesis, cfg Config) (*Chain, error) {
 		return nil, err
 	}
 
+	var supply uint64
+	balances, _ := g.Balances()
+	for _, v := range balances {
+		supply += v // переполнение исключено в Genesis.Balances
+	}
+
 	return &Chain{
 		store:   store,
 		params:  g.Params(),
@@ -104,7 +139,114 @@ func New(store *storage.Store, g *core.Genesis, cfg Config) (*Chain, error) {
 		head:    head,
 		poolIdx: make(map[core.Hash]*core.Tx),
 		pending: core.NewOverlay(store),
+		genesis: gb.Hash,
+		supply:  supply,
+		subs:    make(map[int]chan *core.Block),
 	}, nil
+}
+
+// GenesisHash — хэш блока 0.
+func (c *Chain) GenesisHash() core.Hash { return c.genesis }
+
+// Stats — сводка по сети.
+func (c *Chain) Stats() (Stats, error) {
+	st, err := c.store.Stats()
+	if err != nil {
+		return Stats{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Stats{
+		Height:       c.head.Height,
+		TxCount:      st.TxCount,
+		AccountCount: st.AccountCount,
+		Supply:       c.supply,
+		MempoolSize:  len(c.pool),
+	}, nil
+}
+
+// Subscribe подписывает на новые блоки. Канал закрывается при cancel или если подписчик
+// не успевает забирать блоки (тогда ему нужно переподключиться и догнать по номерам).
+func (c *Chain) Subscribe() (<-chan *core.Block, func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id := c.nextID
+	c.nextID++
+	ch := make(chan *core.Block, subscriberBuffer)
+	c.subs[id] = ch
+	return ch, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if ch, ok := c.subs[id]; ok {
+			delete(c.subs, id)
+			close(ch)
+		}
+	}
+}
+
+func (c *Chain) publishLocked(b *core.Block) {
+	for id, ch := range c.subs {
+		select {
+		case ch <- b:
+		default:
+			delete(c.subs, id)
+			close(ch)
+		}
+	}
+}
+
+// Mempool — до limit транзакций мемпула в порядке приёма.
+func (c *Chain) Mempool(limit int) []TxInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := min(limit, len(c.pool))
+	out := make([]TxInfo, n)
+	for i, tx := range c.pool[:n] {
+		out[i] = TxInfo{Tx: *tx, Hash: tx.Hash(), Status: TxPending}
+	}
+	return out
+}
+
+// PendingFor — транзакции мемпула, где адрес отправитель или получатель.
+func (c *Chain) PendingFor(addr core.Address) []TxInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []TxInfo
+	for _, tx := range c.pool {
+		if tx.From == addr || tx.To == addr {
+			out = append(out, TxInfo{Tx: *tx, Hash: tx.Hash(), Status: TxPending})
+		}
+	}
+	return out
+}
+
+// AddressTxs — подтверждённая история адреса от новых к старым (см. storage.Store.AddressTxs).
+func (c *Chain) AddressTxs(addr core.Address, before *storage.TxLocation, limit int) ([]TxInfo, bool, error) {
+	recs, more, err := c.store.AddressTxs(addr, before, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]TxInfo, 0, len(recs))
+	var b *core.Block
+	for _, r := range recs {
+		if b == nil || b.Height != r.Height {
+			if b, err = c.store.BlockByHeight(r.Height); err != nil {
+				return nil, false, err
+			}
+		}
+		if int(r.Index) >= len(b.Txs) {
+			return nil, false, fmt.Errorf("индекс истории повреждён: блок %d, tx %d", r.Height, r.Index)
+		}
+		out = append(out, confirmed(b, r.Index))
+	}
+	return out, more, nil
+}
+
+func confirmed(b *core.Block, i uint32) TxInfo {
+	return TxInfo{
+		Tx: b.Txs[i], Hash: b.Txs[i].Hash(), Status: TxConfirmed,
+		Height: b.Height, Index: i, BlockHash: b.Hash, BlockTime: b.Time,
+	}
 }
 
 // Params — параметры сети.
@@ -136,28 +278,28 @@ func (c *Chain) BlockByHeight(h uint64) (*core.Block, error) { return c.store.Bl
 // BlockByHash читает блок по хэшу.
 func (c *Chain) BlockByHash(h core.Hash) (*core.Block, error) { return c.store.BlockByHash(h) }
 
-// Tx ищет транзакцию в мемпуле и в блоках.
-func (c *Chain) Tx(h core.Hash) (*core.Tx, TxStatus, uint64, error) {
+// Tx ищет транзакцию в мемпуле и в блоках. Нет нигде — storage.ErrNotFound.
+func (c *Chain) Tx(h core.Hash) (TxInfo, error) {
 	c.mu.Lock()
 	if tx, ok := c.poolIdx[h]; ok {
-		cp := *tx
+		info := TxInfo{Tx: *tx, Hash: h, Status: TxPending}
 		c.mu.Unlock()
-		return &cp, TxPending, 0, nil
+		return info, nil
 	}
 	c.mu.Unlock()
 
 	loc, err := c.store.TxLocation(h)
 	if err != nil {
-		return nil, "", 0, err
+		return TxInfo{}, err
 	}
 	b, err := c.store.BlockByHeight(loc.Height)
 	if err != nil {
-		return nil, "", 0, err
+		return TxInfo{}, err
 	}
 	if int(loc.Index) >= len(b.Txs) {
-		return nil, "", 0, storage.ErrNotFound
+		return TxInfo{}, storage.ErrNotFound
 	}
-	return &b.Txs[loc.Index], TxConfirmed, loc.Height, nil
+	return confirmed(b, loc.Index), nil
 }
 
 // MempoolSize — число транзакций в мемпуле.
@@ -275,6 +417,7 @@ func (c *Chain) addBlockLocked(b *core.Block) error {
 		return err
 	}
 	c.head = b
+	c.publishLocked(b)
 
 	included := make(map[core.Hash]bool, len(b.Txs))
 	for i := range b.Txs {

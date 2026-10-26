@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,9 @@ import (
 	"github.com/makeluaurights/kovchegchain/internal/storage"
 	"github.com/makeluaurights/kovchegchain/internal/wallet"
 )
+
+// Version — версия программы.
+const Version = "0.2.0"
 
 const (
 	defaultNode    = "http://127.0.0.1:7070"
@@ -41,6 +45,11 @@ const usage = `kovcheg — узел и кошелёк сети «Ковчег» 
   kovcheg node                       запустить узел (HTTP на 127.0.0.1:7070)
   kovcheg balance [адрес]            баланс адреса (по умолчанию — своего кошелька)
   kovcheg send <кому> <сумма>        перевести KVG, сумма в KVG: 10, 0.5
+  kovcheg history [адрес]            история переводов адреса
+  kovcheg tx <хэш>                   статус транзакции
+  kovcheg block [номер|хэш]          блок (по умолчанию последний)
+  kovcheg status                     состояние сети
+  kovcheg version                    версия программы
 
 Флаги команды: kovcheg <команда> -h
 `
@@ -64,6 +73,16 @@ func main() {
 		err = cmdBalance(args)
 	case "send":
 		err = cmdSend(args)
+	case "history":
+		err = cmdHistory(args)
+	case "tx":
+		err = cmdTx(args)
+	case "block":
+		err = cmdBlock(args)
+	case "status":
+		err = cmdStatus(args)
+	case "version", "-v", "--version":
+		fmt.Println("kovcheg", Version)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -202,8 +221,15 @@ func cmdNode(args []string) error {
 	walletPath := fs.String("wallet", defaultWalletPath(), "кошелёк узла (для адреса комиссий)")
 	interval := fs.Duration("interval", 5*time.Second, "интервал сборки блоков")
 	emptyBlocks := fs.Bool("empty-blocks", false, "собирать блоки и без транзакций")
+	cors := fs.String("cors", "", "разрешённые Origin для браузеров через запятую; * — любой")
+	rate := fs.Float64("rate", 20, "запросов в секунду с одного IP; 0 — без ограничения")
+	readOnly := fs.Bool("readonly", false, "только чтение: не принимать транзакции")
+	trustProxy := fs.Bool("trust-proxy", false, "узел за прокси/туннелем: брать IP клиента из X-Forwarded-For")
 	if _, err := parseFlags(fs, args); err != nil {
 		return err
+	}
+	if *interval < time.Second {
+		return errors.New("-interval не меньше 1s")
 	}
 
 	g, err := core.LoadGenesis(*genesisPath)
@@ -248,9 +274,31 @@ func cmdNode(args []string) error {
 	}
 	ln, err := net.Listen("tcp", *httpAddr)
 	if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return fmt.Errorf("адрес %s занят: возможно, узел уже запущен (другой адрес — флаг -http)", *httpAddr)
+		}
 		return err
 	}
-	srv := &http.Server{Handler: api.NewHandler(c), ReadHeaderTimeout: 5 * time.Second}
+	opt := api.DefaultOptions()
+	opt.Version = Version
+	opt.BlockInterval = *interval
+	opt.ReadOnly = *readOnly
+	opt.RateLimit = *rate
+	opt.RateBurst = max(1, int(2**rate))
+	opt.TrustProxy = *trustProxy
+	for _, o := range strings.Split(*cors, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			opt.CORSOrigins = append(opt.CORSOrigins, o)
+		}
+	}
+	srv := &http.Server{
+		Handler:           api.NewHandler(c, opt),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second, // поток событий и ?wait=true продлевают его сами
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    16 << 10,
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -258,7 +306,10 @@ func cmdNode(args []string) error {
 	head := c.Head()
 	log.Printf("Ковчег: сеть %s, блок #%d %s", c.Params().ChainID, head.Height, head.Hash)
 	log.Printf("комиссии -> %s, блок каждые %s", producer, *interval)
-	log.Printf("API: http://%s", ln.Addr())
+	log.Printf("API: http://%s (версия %s)", ln.Addr(), Version)
+	if *readOnly {
+		log.Printf("режим только чтения: транзакции не принимаются")
+	}
 
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -274,6 +325,22 @@ func cmdNode(args []string) error {
 	return srv.Shutdown(shCtx)
 }
 
+// walletOrArg — адрес из аргумента или, если аргумента нет, из кошелька.
+func walletOrArg(pos []string, walletPath, cmd string) (core.Address, error) {
+	switch len(pos) {
+	case 0:
+		w, err := wallet.Load(walletPath)
+		if err != nil {
+			return "", fmt.Errorf("укажите адрес: kovcheg %s <адрес> (%v)", cmd, err)
+		}
+		return w.Address, nil
+	case 1:
+		return core.ParseAddress(pos[0])
+	default:
+		return "", fmt.Errorf("используйте: kovcheg %s [адрес]", cmd)
+	}
+}
+
 func cmdBalance(args []string) error {
 	fs := flag.NewFlagSet("balance", flag.ExitOnError)
 	node := fs.String("node", defaultNode, "адрес узла")
@@ -282,29 +349,17 @@ func cmdBalance(args []string) error {
 	if err != nil {
 		return err
 	}
-	var addr core.Address
-	switch len(pos) {
-	case 0:
-		w, err := wallet.Load(*walletPath)
-		if err != nil {
-			return fmt.Errorf("укажите адрес: kovcheg balance <адрес> (%v)", err)
-		}
-		addr = w.Address
-	case 1:
-		if addr, err = core.ParseAddress(pos[0]); err != nil {
-			return err
-		}
-	default:
-		return errors.New("используйте: kovcheg balance <адрес>")
-	}
-
-	b, err := api.NewClient(*node).Balance(addr)
+	addr, err := walletOrArg(pos, *walletPath, "balance")
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Адрес:   %s\nБаланс:  %s KVG (%d нано-KVG)\nNonce:   %d\n", b.Address, b.BalanceKVG, b.Balance, b.Nonce)
-	if b.PendingNonce != b.Nonce {
-		fmt.Printf("В мемпуле: %d транзакц. ожидают блока\n", b.PendingNonce-b.Nonce)
+	a, err := api.NewClient(*node).Account(addr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Адрес:   %s\nБаланс:  %s KVG (%d нано-KVG)\nNonce:   %d\n", a.Address, a.BalanceKVG, a.Balance, a.Nonce)
+	if a.PendingTxs > 0 {
+		fmt.Printf("В мемпуле: %d транзакц., баланс после них: %s KVG\n", a.PendingTxs, a.PendingBalanceKVG)
 	}
 	return nil
 }
@@ -314,6 +369,7 @@ func cmdSend(args []string) error {
 	node := fs.String("node", defaultNode, "адрес узла")
 	walletPath := fs.String("wallet", defaultWalletPath(), "кошелёк отправителя")
 	feeFlag := fs.String("fee", "", "комиссия в KVG (по умолчанию — минимальная сети)")
+	wait := fs.Bool("wait", false, "дождаться попадания в блок")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -335,35 +391,168 @@ func cmdSend(args []string) error {
 	}
 
 	cl := api.NewClient(*node)
-	info, err := cl.Info()
+	st, err := cl.Status()
 	if err != nil {
 		return err
 	}
-	fee := info.MinFee
+	fee := st.MinFee
 	if *feeFlag != "" {
 		if fee, err = core.ParseAmount(*feeFlag); err != nil {
 			return fmt.Errorf("-fee: %w", err)
 		}
 	}
-	bal, err := cl.Balance(w.Address)
+	acc, err := cl.Account(w.Address)
 	if err != nil {
 		return err
 	}
 
 	tx := core.Tx{
-		ChainID: info.ChainID,
+		ChainID: st.ChainID,
 		To:      to,
 		Amount:  amount,
 		Fee:     fee,
-		Nonce:   bal.PendingNonce,
+		Nonce:   acc.PendingNonce,
 	}
 	tx.Sign(w.Private)
-	h, err := cl.SubmitTx(&tx)
+	if *wait {
+		fmt.Println("Отправляю и жду блок...")
+	}
+	res, err := cl.SubmitTx(&tx, *wait, 60*time.Second)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Отправлено %s KVG -> %s (комиссия %s KVG, nonce %d)\nХэш: %s\n",
-		core.FormatAmount(amount), to, core.FormatAmount(fee), tx.Nonce, h)
-	fmt.Printf("Статус: curl '%s/tx?hash=%s'\n", *node, h)
+		core.FormatAmount(amount), to, core.FormatAmount(fee), tx.Nonce, res.Hash)
+	if res.Tx != nil && res.Tx.Block != nil {
+		fmt.Printf("Подтверждено в блоке #%d\n", res.Tx.Block.Height)
+	} else {
+		fmt.Printf("Ждёт блока. Проверить: kovcheg tx %s\n", res.Hash)
+	}
+	return nil
+}
+
+func cmdHistory(args []string) error {
+	fs := flag.NewFlagSet("history", flag.ExitOnError)
+	node := fs.String("node", defaultNode, "адрес узла")
+	walletPath := fs.String("wallet", defaultWalletPath(), "кошелёк (если адрес не указан)")
+	limit := fs.Int("limit", 20, "сколько записей показать (до 100)")
+	before := fs.String("before", "", "показать записи старше этой (значение из «Дальше:»)")
+	pos, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	addr, err := walletOrArg(pos, *walletPath, "history")
+	if err != nil {
+		return err
+	}
+	list, err := api.NewClient(*node).AccountTxs(addr, *before, *limit)
+	if err != nil {
+		return err
+	}
+	if len(list.Pending) == 0 && len(list.Txs) == 0 {
+		fmt.Println("Транзакций нет.")
+		return nil
+	}
+	for _, t := range list.Pending {
+		printHistoryLine("ожидает", t, addr)
+	}
+	for _, t := range list.Txs {
+		printHistoryLine(fmt.Sprintf("блок %d", t.Block.Height), t, addr)
+	}
+	if list.Next != "" {
+		fmt.Printf("Дальше: kovcheg history %s -before %s\n", addr, list.Next)
+	}
+	return nil
+}
+
+func printHistoryLine(where string, t api.TxView, self core.Address) {
+	sign, other := "-", t.To
+	switch t.Direction {
+	case "in":
+		sign, other = "+", t.From
+	case "self":
+		sign = "="
+	}
+	when := ""
+	if t.Block != nil {
+		when = time.Unix(t.Block.Time, 0).Format("2006-01-02 15:04:05") + "  "
+	}
+	fmt.Printf("%s%-10s %s%s KVG  %s  %s\n", when, where, sign, t.AmountKVG, other, t.Hash.String()[:16])
+}
+
+func cmdTx(args []string) error {
+	fs := flag.NewFlagSet("tx", flag.ExitOnError)
+	node := fs.String("node", defaultNode, "адрес узла")
+	pos, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("используйте: kovcheg tx <хэш>")
+	}
+	h, err := core.ParseHash(strings.ToLower(pos[0]))
+	if err != nil {
+		return err
+	}
+	t, err := api.NewClient(*node).Tx(h)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Хэш:       %s\nСтатус:    %s\nОт:        %s\nКому:      %s\nСумма:     %s KVG\nКомиссия:  %s KVG\nNonce:     %d\n",
+		t.Hash, t.Status, t.From, t.To, t.AmountKVG, t.FeeKVG, t.Nonce)
+	if t.Block != nil {
+		fmt.Printf("Блок:      #%d (%s), подтверждений: %d\n",
+			t.Block.Height, time.Unix(t.Block.Time, 0).Format("2006-01-02 15:04:05"), t.Confirmations)
+	}
+	return nil
+}
+
+func cmdBlock(args []string) error {
+	fs := flag.NewFlagSet("block", flag.ExitOnError)
+	node := fs.String("node", defaultNode, "адрес узла")
+	pos, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	id := "latest"
+	switch len(pos) {
+	case 0:
+	case 1:
+		id = pos[0]
+	default:
+		return errors.New("используйте: kovcheg block [номер|хэш]")
+	}
+	b, err := api.NewClient(*node).Block(id)
+	if err != nil {
+		return err
+	}
+	producer := string(b.Producer)
+	if producer == "" {
+		producer = "— (генезис)"
+	}
+	fmt.Printf("Блок #%d\nХэш:            %s\nПредыдущий:     %s\nВремя:          %s\nПроизводитель:  %s\nТранзакций:     %d\nПодтверждений:  %d\n",
+		b.Height, b.Hash, b.PrevHash, time.Unix(b.Time, 0).Format("2006-01-02 15:04:05"), producer, b.TxCount, b.Confirmations)
+	for _, t := range b.Txs {
+		fmt.Printf("  %s  %s -> %s  %s KVG\n", t.Hash.String()[:16], t.From, t.To, t.AmountKVG)
+	}
+	return nil
+}
+
+func cmdStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	node := fs.String("node", defaultNode, "адрес узла")
+	if _, err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	st, err := api.NewClient(*node).Status()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Сеть:            %s (узел %s)\nВысота:          %d\nПоследний блок:  %s (%s)\nТранзакций:      %d\nАккаунтов:       %d\nМонет всего:     %s KVG\nМин. комиссия:   %s KVG\nВ мемпуле:       %d\n",
+		st.ChainID, st.Version, st.Height, st.HeadHash, time.Unix(st.HeadTime, 0).Format("2006-01-02 15:04:05"),
+		st.TxCount, st.AccountCount, st.SupplyKVG, st.MinFeeKVG, st.MempoolTxs)
+	if st.ReadOnly {
+		fmt.Println("Узел только для чтения.")
+	}
 	return nil
 }
